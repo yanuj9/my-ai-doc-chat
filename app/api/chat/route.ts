@@ -1,68 +1,51 @@
+// app/api/chat/route.ts
 import { NextRequest, NextResponse } from 'next/server';
-import { GoogleGenerativeAI, TaskType } from "@google/generative-ai";
-import { supabase } from '@/lib/supabase';
-import { auth } from "@clerk/nextjs/server";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import { supabaseAdmin as supabase } from '@/lib/supabase';
 
 export async function POST(req: NextRequest) {
   try {
-    // 1. Get Authenticated User
-    const { userId } = await auth();
-    if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-
     const { message, chatId } = await req.json();
 
-    // 2. OWNERSHIP VERIFICATION
-    const { data: chat, error: verifyError } = await supabase
-      .from('chats')
-      .select('id')
-      .eq('id', chatId)
-      .eq('user_id', userId)
-      .single();
-
-    if (verifyError || !chat) {
-      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-    }
-
+    // 1. Generate an embedding for the user's QUESTION
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-    const embedModel = genAI.getGenerativeModel({ model: "text-embedding-005" });
-    
-    // 3. Generate Embedding
-    const result = await embedModel.embedContent({
-      content: { role: "user", parts: [{ text: message }] },
-      taskType: TaskType.RETRIEVAL_QUERY,
-    });
-    const queryVector = result.embedding.values;
+    const embeddingModel = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
+    const result = await embeddingModel.embedContent(message);
+    const embedding = result.embedding.values;
 
-    // 4. Search Supabase (The chatId is already verified now)
-    const { data: chunks, error: searchError } = await supabase.rpc('match_document_sections', {
-      query_embedding: queryVector,
-      match_threshold: 0.3,
-      match_count: 5,
-      filter_chat_id: chatId
+    // 2. SEARCH the database for the relevant chunks (The RPC call)
+    const { data: documents, error } = await supabase.rpc('match_documents', {
+      query_embedding: embedding,
+      match_threshold: 0.1, // Adjust based on how strict you want the match
+      match_count: 5,        // Top 5 most relevant chunks
+      p_chat_id: chatId,
     });
 
-    if (searchError) throw searchError;
+    if (error) throw error;
 
-    // 5. Build Context and Ask Gemini
-    const contextText = chunks?.map((c: any) => c.content).join("\n\n---\n\n") || "No relevant context found.";
-    const chatModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    
+    // 3. Create the Context from the matching chunks
+    const context = documents?.map((d: any) => d.content).join("\n---\n") ?? "";
+
+    // 4. Send Context + Question to Gemini for the final answer
+    const chatModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
     const prompt = `
-      You are an AI assistant helping a user with a document. 
-      Use the following retrieved sections to answer the question. 
-      If the answer isn't in the context, say you don't know.
-
+      Answer the question based ONLY on the following context from a PDF document. 
+      If the answer is not in the context, say "I couldn't find that in the document."
+      
       CONTEXT:
-      ${contextText}
-
-      USER QUESTION:
+      ${context}
+      
+      QUESTION: 
       ${message}
     `;
 
     const chatResult = await chatModel.generateContent(prompt);
-    return NextResponse.json({ text: chatResult.response.text() });
+    const responseText = chatResult.response.text();
 
+    return NextResponse.json({ text: responseText });
   } catch (error: any) {
+    console.error("Chat API Error:", error);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
